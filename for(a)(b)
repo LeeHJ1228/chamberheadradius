@@ -1,0 +1,209 @@
+import cv2
+import numpy as np
+import math
+from collections import defaultdict
+
+# =============================================================================
+# 1) 원본 이미지 로드
+# =============================================================================
+IMG_PATH = "showerhead.png"   # 실제 이미지 파일 경로로 수정하세요
+img = cv2.imread(IMG_PATH)
+if img is None:
+    raise FileNotFoundError(f"이미지를 찾을 수 없습니다: {IMG_PATH!r}")
+
+# =============================================================================
+# 2) 사용자가 직접 세 개의 ROI를 선택하도록 함
+#    ▶ ROI 1 = (a), ROI 2 = (b), ROI 3 = (c) 순서대로 드래그하여 영역 지정
+# =============================================================================
+print("▶ ROI 1 (a)를 선택하세요. 드래그한 뒤 Enter/Space를 눌러 확정합니다.")
+r1 = cv2.selectROI("전체 이미지에서 ROI 선택", img, showCrosshair=True, fromCenter=False)
+if r1[2] == 0 or r1[3] == 0:
+    raise RuntimeError("ROI 1 선택이 취소되었습니다.")
+cv2.destroyWindow("전체 이미지에서 ROI 선택")
+
+print(f"ROI 1 좌표: x={r1[0]}, y={r1[1]}, w={r1[2]}, h={r1[3]}")
+
+print("\n▶ ROI 2 (b)를 선택하세요. 드래그 후 Enter/Space를 눌러 확정합니다.")
+r2 = cv2.selectROI("전체 이미지에서 ROI 선택", img, showCrosshair=True, fromCenter=False)
+if r2[2] == 0 or r2[3] == 0:
+    raise RuntimeError("ROI 2 선택이 취소되었습니다.")
+cv2.destroyWindow("전체 이미지에서 ROI 선택")
+
+print(f"ROI 2 좌표: x={r2[0]}, y={r2[1]}, w={r2[2]}, h={r2[3]}")
+
+print("\n▶ ROI 3 (c)를 선택하세요. 드래그 후 Enter/Space를 눌러 확정합니다.")
+r3 = cv2.selectROI("전체 이미지에서 ROI 선택", img, showCrosshair=True, fromCenter=False)
+if r3[2] == 0 or r3[3] == 0:
+    raise RuntimeError("ROI 3 선택이 취소되었습니다.")
+cv2.destroyAllWindows()
+
+print(f"ROI 3 좌표: x={r3[0]}, y={r3[1]}, w={r3[2]}, h={r3[3]}")
+
+# =============================================================================
+# 3) 슬라이싱하여 각 ROI 이미지를 분리
+# =============================================================================
+x1, y1, w1, h1 = r1
+x2, y2, w2, h2 = r2
+x3, y3, w3, h3 = r3
+
+roi1 = img[y1 : y1 + h1, x1 : x1 + w1].copy()
+roi2 = img[y2 : y2 + h2, x2 : x2 + w2].copy()
+roi3 = img[y3 : y3 + h3, x3 : x3 + w3].copy()
+
+# =============================================================================
+# 4) 공통: 헤더(샤워헤드 바디) 내부에서만 '흰색 원(구멍)'을 검출하는 함수
+# =============================================================================
+def extract_header_mask(roi):
+    """
+    - roi: BGR 이미지 (ROI 전체)
+    - 샤워헤드의 원형 바디(검은색 + 구멍 포함)만 골라내는 마스크 생성
+    """
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Otsu + INV: '구멍(원 내부 흰색)'과 '헤더 바디(원 내부 검정)'는 0,
+    # 배경(원 외부 흰색)은 255로 남음.
+    _, bw_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # '흰색(255) 컨투어'들 중 면적이 가장 큰 것 = 배경+헤더 바디
+    contours_all, _ = cv2.findContours(bw_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours_all:
+        return None
+    max_cnt = max(contours_all, key=cv2.contourArea)
+
+    # 최대 컨투어 내부(=헤더 바디 내부)만 255로 채운 마스크
+    mask = np.zeros_like(bw_inv, dtype=np.uint8)
+    cv2.drawContours(mask, [max_cnt], -1, 255, thickness=cv2.FILLED)
+    return mask
+
+def detect_white_circles(roi, min_radius_px=0.5):
+    """
+    1) extract_header_mask() 로 '헤더 내부' 마스크 얻기
+    2) 그레이스케일→블러→Otsu+THRESH_BINARY 를 사용하여
+       roi 전체에서 '흰색 픽셀(구멍 또는 배경)'을 255로 분리
+    3) mask AND 연산 → 헤더 내부의 '흰색 구멍'만 남김
+    4) 작은 노이즈 제거용 Morphology OPEN
+    5) findContours → minEnclosingCircle 로 구멍 반지름(px) 검출
+    6) r >= min_radius_px 조건으로 잡음(너무 작은 원) 걸러내기
+    """
+    header_mask = extract_header_mask(roi)
+    if header_mask is None:
+        return []
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # THRESH_BINARY+Otsu: roi 전체에서 흰색(구멍 또는 배경)은 255
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 헤더 내부에서만 '흰색 픽셀(구멍)'이 남도록 AND
+    holes_only = cv2.bitwise_and(bw, header_mask)
+
+    # 작은 노이즈 제거: Morphology OPEN
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    holes_only = cv2.morphologyEx(holes_only, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 구멍 부분(흰색=255) 컨투어 검출
+    contours, _ = cv2.findContours(holes_only, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    circles = []
+    for cnt in contours:
+        (cx, cy), r = cv2.minEnclosingCircle(cnt)
+        if r >= min_radius_px:
+            circles.append((cx, cy, r))
+    return circles
+
+# =============================================================================
+# 5) ROI1(a)에서 검출된 원을 이용해 픽셀→mm 스케일 계산
+#    ▶ ROI1에 있는 원들은 모두 지름 10 mm
+# =============================================================================
+circles_roi1 = detect_white_circles(roi1, min_radius_px=0.5)
+if len(circles_roi1) == 0:
+    raise RuntimeError(
+        "ROI1(a)에서 흰 원(구멍)을 전혀 검출하지 못했습니다.\n"
+        "detect_white_circles() 내부 thresholding 및 min_radius_px 값을 조정해 주세요."
+    )
+
+# ROI1(a)에서 검출된 원(구멍) 개수 출력
+num_circles_roi1 = len(circles_roi1)
+print(f"[ROI1 (a) 패턴] 검출된 원 개수: {num_circles_roi1}개")
+
+# 픽셀 단위 반지름 목록 → 평균 픽셀 지름 계산
+pix_radii1 = [r_px for (_x, _y, r_px) in circles_roi1]
+pix_diams1 = [2 * r_px for r_px in pix_radii1]
+mean_pix_diam = np.mean(pix_diams1)
+
+# 10 mm / mean_pix_diam(px) = mm_per_px
+mm_per_px = 10.0 / mean_pix_diam
+print(f"[스케일 보정 완료] 1 px = {mm_per_px:.5f} mm   (ROI1 기준)")
+
+# =============================================================================
+# 6) ROI2(b), ROI3(c)에서 원 검출 → 픽셀 반지름→mm 반지름 리스트 변환
+# =============================================================================
+circles_roi2 = detect_white_circles(roi2, min_radius_px=0.5)
+circles_roi3 = detect_white_circles(roi3, min_radius_px=0.5)
+
+def radii_in_mm(circles_px, mm_per_px):
+    """픽셀 반지름 리스트 → mm 반지름 리스트(내림차순)"""
+    return sorted([r_px * mm_per_px for (_x, _y, r_px) in circles_px], reverse=True)
+
+radii_roi2_mm = radii_in_mm(circles_roi2, mm_per_px)
+radii_roi3_mm = radii_in_mm(circles_roi3, mm_per_px)
+
+# =============================================================================
+# 7) tol_px 픽셀 반지름 오차 허용하여 같은 크기끼리 그룹핑
+# =============================================================================
+def group_radii(radii_mm, mm_per_px, tol_px=1):
+    """
+    - radii_mm: [r1_mm, r2_mm, r3_mm, ...] (내림차순)
+    - tol_px   : 픽셀 오차 허용치(±tol_px 픽셀)
+      → tol_mm = tol_px * mm_per_px 만큼 반지름 차이 허용
+    결과: {대표_반지름_mm: 개수, ...} (반지름 내림차순)
+    """
+    tol_mm = tol_px * mm_per_px
+    groups = defaultdict(int)
+
+    for r in radii_mm:
+        placed = False
+        for g in list(groups.keys()):
+            if abs(r - g) <= tol_mm:
+                groups[g] += 1
+                placed = True
+                break
+        if not placed:
+            groups[r] += 1
+
+    # 내림차순 정렬하여 반환
+    sorted_groups = dict(sorted(groups.items(), key=lambda kv: -kv[0]))
+    return sorted_groups
+
+grp_roi2 = group_radii(radii_roi2_mm, mm_per_px, tol_px=1)
+grp_roi3 = group_radii(radii_roi3_mm, mm_per_px, tol_px=1)
+
+# =============================================================================
+# 8) 결과 출력
+# =============================================================================
+def print_groups(label, groups):
+    total = sum(groups.values())
+    print(f"\n◆ {label} (검출된 원 개수: {total}개)")
+    for r_mm, cnt in groups.items():
+        print(f"   • 반지름 ≈ {r_mm:.2f} mm  →  {cnt}개")
+
+print_groups("ROI2 (b) 패턴", grp_roi2)
+print_groups("ROI3 (c) 패턴", grp_roi3)
+
+# =============================================================================
+# 9) (선택) 시각화: 검출된 원 테두리를 그려서 확인
+#    → 디버깅용으로 필요 시 주석 해제하세요.
+# =============================================================================
+def draw_detected(roi, circles_px, window_name):
+    vis = roi.copy()
+    for (cx, cy, r_px) in circles_px:
+        cv2.circle(vis, (int(cx), int(cy)), int(r_px), (0, 255, 0), 2)
+    cv2.imshow(window_name, vis)
+
+# 아래 세 줄을 주석 해제하면, 각 ROI에서 검출된 원들이 초록 테두리로 표시됩니다.
+# draw_detected(roi1, circles_roi1,   "ROI1 (a) 검출 결과")
+# draw_detected(roi2, circles_roi2,   "ROI2 (b) 검출 결과")
+# draw_detected(roi3, circles_roi3,   "ROI3 (c) 검출 결과")
+# cv2.waitKey(0)
+# cv2.destroyAllWindows()
